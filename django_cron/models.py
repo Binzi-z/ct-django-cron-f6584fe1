@@ -38,3 +38,9 @@ class CronJobLog(models.Model):
 class CronJobLock(models.Model):
     job_name = models.CharField(max_length=200, unique=True)
     locked = models.BooleanField(default=False)
+    # When the lock was acquired. Used to expire (self-heal) locks left behind
+    # by a process that died while holding the lock.
+    locked_at = models.DateTimeField(null=True, blank=True)
+    # Identifies the acquirer that currently holds the lock so that releasing is
+    # owner-aware: a process only ever clears the lock it acquired itself.
+    token = models.CharField(max_length=64, null=True, blank=True)
