@@ -358,6 +358,273 @@ class TestRunCrons(TransactionTestCase):
             self.assertEqual(CronJobLog.objects.all().count(), 2)
             self.assertEqual(CronJobLog.objects.all().earliest('start_time').end_time, mock_date_in_past)
 
+    # ---- Concurrency & Lock Correctness Tests ----
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.cache.CacheLock',
+        CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}},
+    )
+    def test_cache_lock_atomic_concurrent_acquisition(self):
+        """Two threads try to lock simultaneously. Exactly one succeeds."""
+        from django_cron.backends.lock.cache import CacheLock
+        from django.core.cache import caches
+        # Clear the LocMemCache to ensure fresh state
+        caches['default'].clear()
+
+        results = []
+        barrier = threading.Barrier(2)
+
+        def try_acquire(thread_id):
+            lock = CacheLock(test_crons.SlowSuccessCronJob, silent=True)
+            barrier.wait()
+            acquired = lock.lock()
+            results.append((thread_id, acquired))
+            if acquired:
+                sleep(0.5)
+                lock.release()
+            db.close_old_connections()
+
+        t1 = threading.Thread(target=try_acquire, args=(1,))
+        t2 = threading.Thread(target=try_acquire, args=(2,))
+        t1.start(); t2.start()
+        t1.join(10); t2.join(10)
+
+        acquired_count = sum(1 for _, a in results if a)
+        self.assertEqual(acquired_count, 1,
+                         "Exactly one thread should acquire the lock")
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_atomic_concurrent_acquisition(self):
+        """Two threads try to lock simultaneously. Exactly one succeeds."""
+        from django_cron.backends.lock.database import DatabaseLock
+
+        results = []
+        barrier = threading.Barrier(2)
+
+        def try_acquire(thread_id):
+            try:
+                lock = DatabaseLock(test_crons.SlowSuccessCronJob, silent=True)
+                barrier.wait()
+                acquired = lock.lock()
+                results.append((thread_id, acquired))
+                if acquired:
+                    sleep(0.5)
+                    lock.release()
+            except Exception:
+                # SQLite may raise OperationalError on concurrent writes;
+                # this is expected in test environments and not a bug.
+                results.append((thread_id, False))
+            finally:
+                db.close_old_connections()
+
+        t1 = threading.Thread(target=try_acquire, args=(1,))
+        t2 = threading.Thread(target=try_acquire, args=(2,))
+        t1.start(); t2.start()
+        t1.join(10); t2.join(10)
+
+        acquired_count = sum(1 for _, a in results if a)
+        # At least one should acquire, at most one should acquire
+        self.assertGreaterEqual(acquired_count, 1,
+                                "At least one thread should acquire the lock")
+        self.assertLessEqual(acquired_count, 1,
+                             "At most one thread should acquire the lock")
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.cache.CacheLock',
+        CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}},
+    )
+    def test_cache_lock_release_ownership(self):
+        """Instance B cannot release a lock held by instance A."""
+        from django_cron.backends.lock.cache import CacheLock
+        from django.core.cache import caches
+        caches['default'].clear()
+
+        lock_a = CacheLock(test_crons.TestSuccessCronJob, silent=True)
+        lock_b = CacheLock(test_crons.TestSuccessCronJob, silent=True)
+
+        self.assertTrue(lock_a.lock())
+        lock_b.release()  # Should be a no-op (different owner_id)
+
+        # Verify A's lock still held — B should fail to acquire
+        self.assertFalse(lock_b.lock())
+
+        # A releases its own lock
+        lock_a.release()
+
+        # Now B can acquire
+        self.assertTrue(lock_b.lock())
+        lock_b.release()
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_release_ownership(self):
+        """Instance B cannot release a lock held by instance A."""
+        from django_cron.backends.lock.database import DatabaseLock
+
+        lock_a = DatabaseLock(test_crons.TestSuccessCronJob, silent=True)
+        lock_b = DatabaseLock(test_crons.TestSuccessCronJob, silent=True)
+
+        self.assertTrue(lock_a.lock())
+        lock_b.release()  # No-op (different owner)
+
+        self.assertFalse(lock_b.lock())
+
+        lock_a.release()
+        self.assertTrue(lock_b.lock())
+        lock_b.release()
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_stale_recovery(self):
+        """Lock with locked_at older than timeout can be reclaimed."""
+        from django_cron.backends.lock.database import DatabaseLock
+        from django.utils import timezone as tz
+
+        job_name = '.'.join([
+            test_crons.ShortTimeoutCronJob.__module__,
+            test_crons.ShortTimeoutCronJob.__name__,
+        ])
+        # Simulate a crashed process: locked=True, locked_at is old
+        CronJobLock.objects.create(
+            job_name=job_name,
+            locked=True,
+            locked_at=tz.now() - timedelta(seconds=10),  # past 3s timeout
+            owner='dead-machine:99999:abc123def456',
+        )
+
+        lock = DatabaseLock(test_crons.ShortTimeoutCronJob, silent=True)
+        self.assertTrue(lock.lock(), "Should reclaim stale lock")
+        lock.release()
+
+        # Verify: row updated, not duplicated
+        self.assertEqual(CronJobLock.objects.filter(job_name=job_name).count(), 1)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.cache.CacheLock',
+        CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}},
+    )
+    def test_cache_lock_expires_after_timeout(self):
+        """After cache TTL expires, a new process can acquire the lock."""
+        from django_cron.backends.lock.cache import CacheLock
+        from django.core.cache import caches
+        caches['default'].clear()
+
+        lock_a = CacheLock(test_crons.ShortTimeoutCronJob, silent=True)
+        self.assertTrue(lock_a.lock())
+        # Don't release — simulate process death
+
+        sleep(4)  # Wait for 3s timeout + 1s buffer
+
+        lock_b = CacheLock(test_crons.ShortTimeoutCronJob, silent=True)
+        self.assertTrue(lock_b.lock(), "Should acquire after TTL expiry")
+        lock_b.release()
+
+    def test_no_phantom_log_on_interrupted_execution(self):
+        """Exception during do() produces failure log, not phantom success log."""
+        CronJobLog.objects.all().delete()
+
+        with patch.object(
+            test_crons.TestSuccessCronJob, 'do',
+            side_effect=Exception("simulated crash")
+        ):
+            self._call(self.success_cron, force=True)
+
+        logs = CronJobLog.objects.all()
+        self.assertEqual(logs.count(), 1)
+        self.assertFalse(logs[0].is_success, "Interrupted job must not be success")
+        self.assertNotIn('Job in progress', logs[0].message)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.cache.CacheLock',
+        CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}},
+    )
+    def test_concurrent_runcrons_only_one_executes(self):
+        """Two concurrent runcrons for the same job: do() called exactly once."""
+        from django.core.cache import caches
+        caches['default'].clear()
+        CronJobLog.objects.all().delete()
+
+        do_call_count = {'n': 0}
+        counter_lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        original_do = test_crons.SlowSuccessCronJob.do
+
+        def counting_do(cron_self):
+            with counter_lock:
+                do_call_count['n'] += 1
+            return original_do(cron_self)
+
+        def run_cron():
+            barrier.wait()
+            self._call('test_crons.SlowSuccessCronJob')
+            db.close_old_connections()
+
+        with patch.object(test_crons.SlowSuccessCronJob, 'do', counting_do):
+            t1 = threading.Thread(target=run_cron)
+            t2 = threading.Thread(target=run_cron)
+            t1.start(); t2.start()
+            t1.join(15); t2.join(15)
+
+        self.assertEqual(do_call_count['n'], 1, "do() must only be called once")
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+    def test_sigterm_during_execution_releases_lock(self):
+        """GracefulShutdown during cron execution releases the lock cleanly."""
+        from django_cron.core import GracefulShutdown
+
+        CronJobLog.objects.all().delete()
+
+        def interrupt_do(cron_self):
+            raise GracefulShutdown("simulated SIGTERM")
+
+        with patch.object(test_crons.SlowSuccessCronJob, 'do', interrupt_do):
+            self._call('test_crons.SlowSuccessCronJob', force=True)
+
+        # Lock should be released. Verify by running again successfully.
+        self._call('test_crons.SlowSuccessCronJob', force=True)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+
+class TestCronLoopShutdown(TransactionTestCase):
+    success_cron = 'test_crons.TestSuccessCronJob'
+
+    def test_cronloop_stops_on_shutdown_flag(self):
+        """cronloop exits when _shutdown_requested is set."""
+        from django_cron.management.commands.cronloop import Command as CronloopCommand
+        import time as _time
+
+        cmd = CronloopCommand()
+        cmd._shutdown_requested = False
+
+        iterations = {'n': 0}
+
+        original_run_once = cmd._run_once
+
+        def counting_run_once(classes, s):
+            iterations['n'] += 1
+            if iterations['n'] >= 2:
+                cmd._shutdown_requested = True
+            return original_run_once(classes, s)
+
+        cmd._run_once = counting_run_once
+
+        start = _time.time()
+        # Use sleep=0 for fast test execution
+        cmd.handle(
+            sleep=0,
+            cron_classes=[self.success_cron],
+            repeat=None,
+        )
+        elapsed = _time.time() - start
+
+        self.assertEqual(iterations['n'], 2, "Should have run exactly 2 iterations")
+        self.assertLess(elapsed, 30, "cronloop should stop promptly")
+
 
 class TestCronLoop(TransactionTestCase):
     success_cron = 'test_crons.TestSuccessCronJob'

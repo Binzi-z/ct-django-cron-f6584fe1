@@ -38,3 +38,5 @@ class CronJobLog(models.Model):
 class CronJobLock(models.Model):
     job_name = models.CharField(max_length=200, unique=True)
     locked = models.BooleanField(default=False)
+    locked_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    owner = models.CharField(max_length=255, blank=True, default='')

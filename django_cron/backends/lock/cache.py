@@ -1,6 +1,5 @@
 from django.conf import settings
 from django.core.cache import caches
-from django.utils import timezone
 
 from django_cron.backends.lock.base import DjangoCronJobLock
 
@@ -9,6 +8,10 @@ class CacheLock(DjangoCronJobLock):
     """
     One of simplest lock backends, uses django cache to
     prevent parallel runs of commands.
+
+    Uses cache.add() for atomic lock acquisition — this is guaranteed
+    to be atomic across all built-in Django cache backends
+    (Memcached 'add', Redis 'SET NX', file-based cache with file lock).
     """
 
     DEFAULT_LOCK_TIME = 24 * 60 * 60  # 24 hours
@@ -22,22 +25,29 @@ class CacheLock(DjangoCronJobLock):
 
     def lock(self):
         """
-        This method sets a cache variable to mark current job as "already running".
+        Atomically attempt to set the lock key.
+        cache.add() returns True ONLY if the key did not exist.
+        This eliminates the TOCTOU race present in get()+set().
+        The stored value is the owner_id for ownership verification.
         """
-        if self.cache.get(self.lock_name):
-            return False
-        else:
-            self.cache.set(self.lock_name, timezone.now(), self.timeout)
+        if self.cache.add(self.lock_name, self.owner_id, self.timeout):
             return True
+        return False
 
     def release(self):
-        self.cache.delete(self.lock_name)
+        """
+        Release the lock only if we are the owner.
+        This prevents one machine from clearing another's lock.
+        """
+        stored_owner = self.cache.get(self.lock_name)
+        if stored_owner == self.owner_id:
+            self.cache.delete(self.lock_name)
 
     def lock_failed_message(self):
-        started = self.get_running_lock_date()
+        stored = self.cache.get(self.lock_name)
         msgs = [
-            "%s: lock has been found. Other cron started at %s"
-            % (self.job_name, started),
+            "%s: lock has been found. Owner: %s"
+            % (self.job_name, stored),
             "Current timeout for job %s is %s seconds (cache key name is '%s')."
             % (self.job_name, self.timeout, self.lock_name),
         ]
@@ -58,17 +68,12 @@ class CacheLock(DjangoCronJobLock):
         return self.job_name
 
     def get_cache_timeout(self, cron_class):
-        try:
-            timeout = getattr(
-                cron_class, 'DJANGO_CRON_LOCK_TIME', settings.DJANGO_CRON_LOCK_TIME
-            )
-        except:
+        # Check cron class first, then settings, then default.
+        # Use explicit None checks to avoid eager evaluation of
+        # settings.DJANGO_CRON_LOCK_TIME (which may not exist).
+        timeout = getattr(cron_class, 'DJANGO_CRON_LOCK_TIME', None)
+        if timeout is None:
+            timeout = getattr(settings, 'DJANGO_CRON_LOCK_TIME', None)
+        if timeout is None:
             timeout = self.DEFAULT_LOCK_TIME
         return timeout
-
-    def get_running_lock_date(self):
-        date = self.cache.get(self.lock_name)
-        if date and not timezone.is_aware(date):
-            tz = timezone.get_current_timezone()
-            date = timezone.make_aware(date, tz)
-        return date

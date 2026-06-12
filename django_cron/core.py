@@ -19,6 +19,11 @@ class BadCronJobError(AssertionError):
     pass
 
 
+class GracefulShutdown(Exception):
+    """Raised when SIGTERM is received during cron execution."""
+    pass
+
+
 class Schedule(object):
     def __init__(
             self,
@@ -232,6 +237,11 @@ class CronJobManager(object):
                 )
                 logger.error(err_msg)
 
+        # Allow GracefulShutdown to propagate so the management command
+        # can stop iterating over remaining cron classes.
+        if ex_type is GracefulShutdown:
+            return False
+
         return True  # prevent exception propagation
 
     def run(self, force=False):
@@ -262,7 +272,10 @@ class CronJobManager(object):
                         cron_job_class.__name__,
                         self.cron_job.code,
                     )
-                    self.make_log('Job in progress', success=True)
+                    # Execute FIRST, log AFTER.
+                    # If do() raises, __exit__ catches and writes failure log.
+                    # If process is killed, NO log is written — correct behavior
+                    # because the job did not complete.
                     self.msg = self.cron_job.do()
                     self.make_log(self.msg, success=True)
                     self.cron_job.set_prev_success_cron(

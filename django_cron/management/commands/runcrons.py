@@ -1,4 +1,5 @@
 from __future__ import print_function
+import signal
 import traceback
 from datetime import timedelta
 
@@ -7,6 +8,7 @@ from django.conf import settings
 from django.db import close_old_connections
 
 from django_cron import CronJobManager, get_class, get_current_time
+from django_cron.core import GracefulShutdown
 from django_cron.models import CronJobLog
 
 
@@ -51,14 +53,42 @@ class Command(BaseCommand):
             )
             return
 
-        for cron_class in crons_to_run:
-            run_cron_with_cache_check(
-                cron_class,
-                force=options['force'],
-                silent=options['silent'],
-                dry_run=options['dry_run'],
-                stdout=self.stdout,
-            )
+        # Register SIGTERM handler for graceful shutdown.
+        # When SIGTERM arrives, this raises GracefulShutdown which
+        # propagates through the with-statement stack, triggering
+        # lock release via __exit__.
+        # signal.signal() only works in the main thread; skip if called
+        # from a non-main thread (e.g. in tests or embedded contexts).
+        import threading as _threading
+        previous_handler = None
+        if _threading.current_thread() is _threading.main_thread():
+            def _sigterm_handler(signum, frame):
+                raise GracefulShutdown("Received SIGTERM, shutting down gracefully")
+
+            try:
+                previous_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
+            except (ValueError, OSError):
+                previous_handler = None
+        try:
+            for cron_class in crons_to_run:
+                run_cron_with_cache_check(
+                    cron_class,
+                    force=options['force'],
+                    silent=options['silent'],
+                    dry_run=options['dry_run'],
+                    stdout=self.stdout,
+                )
+        except GracefulShutdown:
+            # SIGTERM received. Lock __exit__ has already released
+            # the lock as the exception propagated through the stack.
+            if not options['silent']:
+                self.stdout.write(
+                    "Graceful shutdown: skipping remaining crons\n"
+                )
+        finally:
+            # Always restore the previous signal handler.
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)
 
         clear_old_log_entries()
         close_old_connections()

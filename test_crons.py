@@ -89,3 +89,23 @@ class RunEveryMinuteAndRemoveOldLogs(CronJobBase):
 
     def do(self):
         pass
+
+
+class SlowSuccessCronJob(CronJobBase):
+    """Takes 2 seconds — for concurrency tests."""
+    code = 'test_slow_success_cron_job'
+    schedule = Schedule(run_every_mins=0)
+
+    def do(self):
+        sleep(2)
+        return 'slow success'
+
+
+class ShortTimeoutCronJob(CronJobBase):
+    """Short lock timeout (3s) — for stale lock tests."""
+    code = 'test_short_timeout_cron_job'
+    schedule = Schedule(run_every_mins=0)
+    DJANGO_CRON_LOCK_TIME = 3
+
+    def do(self):
+        return 'short timeout'

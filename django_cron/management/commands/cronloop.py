@@ -1,6 +1,9 @@
+import signal
 from time import sleep
 
 from django.core.management import BaseCommand, call_command
+
+from django_cron.core import GracefulShutdown
 
 
 class Command(BaseCommand):
@@ -34,18 +37,33 @@ class Command(BaseCommand):
         if not classes:
             classes = []
         repeat = options["repeat"]
-        if repeat:
-            for _ in range(repeat):
-                if self._call_command_or_return_true('runcrons', classes, s):
-                    break
-        else:
-            while True:
-                if self._call_command_or_return_true('runcrons', classes, s):
-                    break
 
-    def _call_command_or_return_true(self, command, classes, s):
+        self._shutdown_requested = False
+        previous_handler = signal.signal(
+            signal.SIGTERM, self._handle_sigterm
+        )
+
         try:
-            call_command(command, *classes)
+            if repeat:
+                for _ in range(repeat):
+                    if self._run_once(classes, s):
+                        break
+            else:
+                while not self._shutdown_requested:
+                    if self._run_once(classes, s):
+                        break
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+
+    def _handle_sigterm(self, signum, frame):
+        """Set flag so the loop exits cleanly after current iteration."""
+        self._shutdown_requested = True
+
+    def _run_once(self, classes, s):
+        """Run one iteration. Returns True if loop should stop."""
+        try:
+            call_command('runcrons', *classes)
             sleep(s)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, GracefulShutdown):
             return True
+        return False

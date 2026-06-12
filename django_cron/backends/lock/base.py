@@ -1,36 +1,50 @@
+import os
+import socket
+import uuid
+
+
 class DjangoCronJobLock(object):
     """
-    The lock class to use in runcrons management command.
-    Intendent usage is
-    with CacheLock(cron_class, silent):
-        do work
-    or inside try - except:
-    try:
-        with CacheLock(cron_class, silent):
-            do work
-    except DjangoCronJobLock.LockFailedException:
-        pass
+    Base lock class with ownership tracking and stale detection.
+
+    Subclasses MUST implement:
+      - lock()     -> bool (True = acquired, False = failed)
+      - release()  -> None
+
+    Subclasses MAY implement:
+      - is_stale()          -> bool (default: False)
+      - get_lock_timeout()  -> int seconds (default: 86400)
     """
 
     class LockFailedException(Exception):
         pass
 
+    DEFAULT_LOCK_TIMEOUT = 24 * 60 * 60  # 24 hours
+
     def __init__(self, cron_class, silent, *args, **kwargs):
         """
         This method inits the class.
-        You should take care of getting all
-        necessary thing from input parameters here
         Base class processes
             * self.job_name
             * self.job_code
             * self.parallel
             * self.silent
+            * self.lock_acquired
+            * self.owner_id
         for you. The rest is backend-specific.
         """
         self.job_name = '.'.join([cron_class.__module__, cron_class.__name__])
         self.job_code = cron_class.code
         self.parallel = getattr(cron_class, 'ALLOW_PARALLEL_RUNS', False)
         self.silent = silent
+        self.lock_acquired = False
+        # Unique owner identity: hostname:pid:uuid
+        # - hostname distinguishes machines
+        # - pid distinguishes processes on same machine
+        # - uuid distinguishes restarts (handles PID reuse)
+        self.owner_id = "{}:{}:{}".format(
+            socket.gethostname(), os.getpid(), uuid.uuid4().hex[:12]
+        )
 
     def lock(self):
         """
@@ -54,13 +68,27 @@ class DjangoCronJobLock(object):
             'You have to implement release(self) method for your class'
         )
 
+    def is_stale(self):
+        """Return True if a held lock is stale. Override per backend."""
+        return False
+
+    def get_lock_timeout(self):
+        """Return lock timeout in seconds."""
+        return self.DEFAULT_LOCK_TIMEOUT
+
     def lock_failed_message(self):
         return "%s: lock found. Will try later." % self.job_name
 
     def __enter__(self):
-        if not self.parallel and not self.lock():
-            raise self.LockFailedException(self.lock_failed_message())
-
-    def __exit__(self, type, value, traceback):
         if not self.parallel:
-            self.release()
+            self.lock_acquired = self.lock()
+            if not self.lock_acquired:
+                raise self.LockFailedException(self.lock_failed_message())
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.parallel and self.lock_acquired:
+            try:
+                self.release()
+            finally:
+                self.lock_acquired = False
