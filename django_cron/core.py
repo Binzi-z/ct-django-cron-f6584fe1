@@ -185,7 +185,7 @@ class CronJobManager(object):
         cron_log.end_time = get_current_time()
         cron_log.save()
 
-        if not cron_log.is_success and self.write_log:
+        if not cron_log.is_success and self.write_log and kwargs.get('error_log', True):
             logger.error("%s cronjob error:\n%s" % (cron_log.code, cron_log.message))
 
     def make_log_msg(self, messages):
@@ -262,7 +262,12 @@ class CronJobManager(object):
                         cron_job_class.__name__,
                         self.cron_job.code,
                     )
-                    self.make_log('Job in progress', success=True)
+                    # Record the run as not-yet-successful first. If the process
+                    # is killed (or do() raises) while running, this row stays
+                    # is_success=False so the run is never mistaken for a
+                    # completed success in later scheduling decisions. It is
+                    # flipped to success only after do() returns below.
+                    self.make_log('Job in progress', success=False, error_log=False)
                     self.msg = self.cron_job.do()
                     self.make_log(self.msg, success=True)
                     self.cron_job.set_prev_success_cron(

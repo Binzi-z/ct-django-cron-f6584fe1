@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.core.cache import caches
 from django.utils import timezone
@@ -19,19 +21,33 @@ class CacheLock(DjangoCronJobLock):
         self.cache = self.get_cache_by_name()
         self.lock_name = self.get_lock_name()
         self.timeout = self.get_cache_timeout(cron_class)
+        # Unique per acquisition so release() only ever clears our own lock.
+        self.token = None
 
     def lock(self):
         """
         This method sets a cache variable to mark current job as "already running".
+
+        ``cache.add`` is atomic: it only stores the value if the key is not
+        already present and reports whether it did. This prevents two processes
+        from both believing they acquired the lock (which a get-then-set would
+        allow). The cache timeout means a process that dies while holding the
+        lock will not keep it forever.
         """
-        if self.cache.get(self.lock_name):
-            return False
-        else:
-            self.cache.set(self.lock_name, timezone.now(), self.timeout)
-            return True
+        self.token = uuid.uuid4().hex
+        payload = {'token': self.token, 'time': timezone.now()}
+        return bool(self.cache.add(self.lock_name, payload, self.timeout))
 
     def release(self):
-        self.cache.delete(self.lock_name)
+        """
+        Release the lock only if we are still the owner.
+
+        Without the token check a process finishing late could delete a lock
+        that another process has since acquired and is still running under.
+        """
+        payload = self.cache.get(self.lock_name)
+        if isinstance(payload, dict) and payload.get('token') == self.token:
+            self.cache.delete(self.lock_name)
 
     def lock_failed_message(self):
         started = self.get_running_lock_date()
@@ -67,7 +83,8 @@ class CacheLock(DjangoCronJobLock):
         return timeout
 
     def get_running_lock_date(self):
-        date = self.cache.get(self.lock_name)
+        payload = self.cache.get(self.lock_name)
+        date = payload.get('time') if isinstance(payload, dict) else payload
         if date and not timezone.is_aware(date):
             tz = timezone.get_current_timezone()
             date = timezone.make_aware(date, tz)

@@ -10,13 +10,17 @@ from freezegun import freeze_time
 from django import db
 from django.test import TransactionTestCase
 from django.core.management import call_command
+from django.core.cache import caches
 from django.test.utils import override_settings
 from django.test.client import Client
 from django.urls import reverse
+from django.utils import timezone
 from django.contrib.auth.models import User
 
 from django_cron.helpers import humanize_duration
 from django_cron.models import CronJobLog, CronJobLock
+from django_cron.backends.lock.cache import CacheLock
+from django_cron.backends.lock.database import DatabaseLock
 import test_crons
 
 
@@ -286,6 +290,187 @@ class TestRunCrons(TransactionTestCase):
         self._call(self.wait_3sec_cron)
         t.join(10)
         self.assertEqual(CronJobLog.objects.all().count(), 1)
+
+    # -- Concurrency: overlapping execution and failure recovery -------------
+    # These cover the two-machines-sharing-one-database topology where a job
+    # could previously run twice in a minute, one run could clear another's
+    # still-held lock, and a crashed/failed run could be recorded as a success
+    # or leave a permanently stuck lock.
+
+    def test_overlapping_run_does_not_change_state_cache(self):
+        """A process that does not get the (cache) lock must not run or log,
+        and must not clear the lock the running process still holds."""
+        caches['default'].clear()
+        CronJobLog.objects.all().delete()
+
+        # Machine 1 acquires the lock and is still "running".
+        holder = CacheLock(test_crons.TestSuccessCronJob, silent=True)
+        self.assertTrue(holder.lock())
+        try:
+            # Machine 2 attempts the same job: it must be locked out.
+            self._call(self.success_cron, force=True)
+            self.assertEqual(CronJobLog.objects.count(), 0)
+            # Machine 2 must not have released machine 1's still-held lock.
+            self.assertIsNotNone(caches['default'].get(holder.lock_name))
+        finally:
+            holder.release()
+        # Owner releasing actually clears it.
+        self.assertIsNone(caches['default'].get(holder.lock_name))
+
+    def test_cache_release_is_owner_aware(self):
+        """A loser of the lock race releasing must not drop the winner's lock."""
+        caches['default'].clear()
+        first = CacheLock(test_crons.TestSuccessCronJob, silent=True)
+        second = CacheLock(test_crons.TestSuccessCronJob, silent=True)
+
+        self.assertTrue(first.lock())
+        # Acquisition is atomic: the second acquirer cannot also win.
+        self.assertFalse(second.lock())
+
+        # second never owned the lock, so releasing must be a no-op.
+        second.release()
+        self.assertIsNotNone(caches['default'].get(first.lock_name))
+
+        first.release()
+        self.assertIsNone(caches['default'].get(first.lock_name))
+
+    def test_failed_job_releases_lock_cache(self):
+        """A job that raises must record a failure and free the (cache) lock so
+        the next run is not blocked forever."""
+        caches['default'].clear()
+        CronJobLog.objects.all().delete()
+
+        self._call(self.error_cron, force=True)
+
+        self.assertEqual(CronJobLog.objects.count(), 1)
+        self.assertFalse(CronJobLog.objects.get().is_success)
+        lock_name = '.'.join(
+            [test_crons.TestErrorCronJob.__module__, test_crons.TestErrorCronJob.__name__]
+        )
+        self.assertIsNone(caches['default'].get(lock_name))
+
+        # A subsequent run is able to acquire the freed lock and run again.
+        self._call(self.error_cron, force=True)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_overlapping_run_does_not_change_state_database(self):
+        """A process that does not get the (database) lock must not run or log,
+        and must leave the running process's lock untouched."""
+        CronJobLog.objects.all().delete()
+
+        holder = DatabaseLock(test_crons.TestSuccessCronJob, silent=True)
+        self.assertTrue(holder.lock())
+        try:
+            self._call(self.success_cron, force=True)
+            self.assertEqual(CronJobLog.objects.count(), 0)
+            row = CronJobLock.objects.get(job_name=holder.job_name)
+            self.assertTrue(row.locked)
+            self.assertEqual(row.token, holder.token)
+        finally:
+            holder.release()
+        self.assertFalse(CronJobLock.objects.get(job_name=holder.job_name).locked)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_release_is_owner_aware(self):
+        """A loser of the (database) lock race releasing must not drop the
+        winner's lock."""
+        holder = DatabaseLock(test_crons.TestSuccessCronJob, silent=True)
+        other = DatabaseLock(test_crons.TestSuccessCronJob, silent=True)
+
+        self.assertTrue(holder.lock())
+        self.assertFalse(other.lock())
+
+        other.release()  # other never owned it -> no-op
+        row = CronJobLock.objects.get(job_name=holder.job_name)
+        self.assertTrue(row.locked)
+        self.assertEqual(row.token, holder.token)
+
+        holder.release()
+        self.assertFalse(CronJobLock.objects.get(job_name=holder.job_name).locked)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_self_heals_stale_lock(self):
+        """A lock left behind by a process that died is reclaimed once it is
+        older than the configured lock time (default 24h)."""
+        lock = DatabaseLock(test_crons.TestSuccessCronJob, silent=True)
+        CronJobLock.objects.create(
+            job_name=lock.job_name,
+            locked=True,
+            locked_at=timezone.now() - timedelta(hours=48),
+            token='dead-process',
+        )
+
+        self.assertTrue(lock.lock())
+        row = CronJobLock.objects.get(job_name=lock.job_name)
+        self.assertTrue(row.locked)
+        self.assertEqual(row.token, lock.token)
+        self.assertNotEqual(row.token, 'dead-process')
+
+        lock.release()
+        self.assertFalse(CronJobLock.objects.get(job_name=lock.job_name).locked)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_not_reclaimed_while_fresh(self):
+        """A recently acquired lock must not be reclaimed - it is still held."""
+        lock = DatabaseLock(test_crons.TestSuccessCronJob, silent=True)
+        CronJobLock.objects.create(
+            job_name=lock.job_name,
+            locked=True,
+            locked_at=timezone.now(),
+            token='still-running',
+        )
+        self.assertFalse(lock.lock())
+        # The fresh lock is untouched.
+        row = CronJobLock.objects.get(job_name=lock.job_name)
+        self.assertTrue(row.locked)
+        self.assertEqual(row.token, 'still-running')
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_failed_job_releases_lock_database(self):
+        """A job that raises must free the (database) lock, not leave it stuck."""
+        CronJobLog.objects.all().delete()
+
+        self._call(self.error_cron, force=True)
+
+        self.assertFalse(CronJobLog.objects.get().is_success)
+        job_name = '.'.join(
+            [test_crons.TestErrorCronJob.__module__, test_crons.TestErrorCronJob.__name__]
+        )
+        self.assertFalse(CronJobLock.objects.get(job_name=job_name).locked)
+
+    def test_in_progress_log_is_not_success_until_done(self):
+        """The 'in progress' log row must be is_success=False while do() runs
+        (so a killed run is never counted as a success) and flip to success
+        only after do() returns."""
+        CronJobLog.objects.all().delete()
+        observed = {}
+
+        def fake_do(job_self):
+            log = CronJobLog.objects.get(code=test_crons.TestSuccessCronJob.code)
+            observed['is_success_during_run'] = log.is_success
+            observed['message_during_run'] = log.message
+            return 'done'
+
+        with patch.object(test_crons.TestSuccessCronJob, 'do', fake_do):
+            self._call(self.success_cron, force=True)
+
+        self.assertFalse(observed['is_success_during_run'])
+        self.assertIn('Job in progress', observed['message_during_run'])
+
+        log = CronJobLog.objects.get(code=test_crons.TestSuccessCronJob.code)
+        self.assertTrue(log.is_success)
+        self.assertEqual(log.message.strip(), 'done')
 
     # TODO: this test doesn't pass - seems that second cronjob is locking file
     # however it should throw an exception that file is locked by other cronjob
